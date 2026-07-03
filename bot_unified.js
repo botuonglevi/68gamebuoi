@@ -31,16 +31,20 @@ async function getWSS(landing) {
         await client.send("Network.enable");
 
         let wssUrl = null;
+        let resolved = false;
 
         // Listen for WebSocket creation events
         const waitWss = new Promise((resolve, reject) => {
             const timeoutId = setTimeout(() => {
-                reject(new Error("Timeout waiting for WSS (90s)"));
+                if (!resolved) {
+                    reject(new Error("Timeout waiting for WSS (90s)"));
+                }
             }, 90000);
 
             client.on("Network.webSocketCreated", (p) => {
                 console.log(`📡 [WSS-FETCH] WS Created: ${p.url}`);
-                if (p.url.includes("wss://")) {
+                if (p.url && p.url.includes("wss://")) {
+                    resolved = true;
                     clearTimeout(timeoutId);
                     resolve(p.url);
                 }
@@ -51,12 +55,24 @@ async function getWSS(landing) {
         await page.goto(landing, { waitUntil: "domcontentloaded", timeout: 90000 });
 
         wssUrl = await waitWss;
+        
+        // Validate WSS URL
+        if (!wssUrl || !wssUrl.startsWith('wss://')) {
+            throw new Error(`Invalid WSS URL: ${wssUrl}`);
+        }
+        
         return wssUrl;
     } catch (err) {
         console.error(`❌ [WSS-FETCH] Lỗi khi lấy WSS: ${err.message}`);
         throw err;
     } finally {
-        if (browser) await browser.close();
+        if (browser) {
+            try {
+                await browser.close();
+            } catch (e) {
+                // Ignore close errors
+            }
+        }
     }
 }
 
@@ -67,13 +83,14 @@ class Bot68GB {
         this.ws = null;
         this.auth_done = false;
         this.req_id = Math.floor(Math.random() * 1000) + 500;
+        this.heartbeat = null;
+        this.auth_timeout = null;
+        this.reconnect_delay = 1000;
+        this.max_reconnect_delay = 30000;
+        this.is_connecting = false;
 
         this.txhu = { history: [], last_result: null, last_sig: "", prev_session: 0, last_msg: Date.now() };
         this.md5 = { history: [], last_result: null, last_sig: "", prev_session: 0, last_msg: Date.now(), current_md5: "" };
-
-        this.reconnect_delay = 1000;
-        this.max_reconnect_delay = 30000;
-        this.auth_timeout = null;
     }
 
     _makePacket(route, body = "{}") {
@@ -97,8 +114,17 @@ class Bot68GB {
         console.log(`🚀 [AUTH] Khởi động...`);
         if (this.auth_timeout) clearTimeout(this.auth_timeout);
         this.auth_timeout = setTimeout(() => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
-            this.ws.send(this.shared.PKT_AUTH);
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                console.log(`⚠️ [AUTH] WebSocket not open, skipping auth`);
+                return;
+            }
+            
+            // Gửi token auth
+            if (this.shared.PKT_AUTH && this.shared.PKT_AUTH.length > 0) {
+                this.ws.send(this.shared.PKT_AUTH);
+            } else {
+                console.log(`⚠️ [AUTH] No token available!`);
+            }
 
             const routes = [
                 "lobby.account.getgamelist",
@@ -110,10 +136,12 @@ class Bot68GB {
 
             routes.forEach((r, i) => {
                 setTimeout(() => {
-                    if (this.ws && this.ws.readyState === WebSocket.OPEN)
+                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                         this.ws.send(this._makePacket(r));
+                    }
                 }, 400 * (i + 1));
             });
+            
             setTimeout(() => {
                 this.auth_done = true;
                 this.reconnect_delay = 1000; // Reset delay when auth succeeds
@@ -123,19 +151,33 @@ class Bot68GB {
     }
 
     async run(landingPage = "https://68gbvn88.bar") {
+        // Prevent multiple simultaneous connection attempts
+        if (this.is_connecting) {
+            console.log(`⏳ [${this.name}] Already connecting, skipping...`);
+            return;
+        }
+        this.is_connecting = true;
+
         this.req_id = Math.floor(Math.random() * 1000) + 500;
+        this.auth_done = false;
 
         try {
             // Chỉ tìm WSS nếu chưa có trong shared
             if (!this.shared.WS_URL || this.shared.WS_URL.length < 10) {
                 console.log(`📡 [${this.name}] Đang tìm kiếm WSS từ: ${landingPage}...`);
-                this.shared.WS_URL = await getWSS(landingPage);
-                console.log(`✨ [${this.name}] WSS FOUND: ${this.shared.WS_URL}`);
+                const wssUrl = await getWSS(landingPage);
+                if (wssUrl && wssUrl.startsWith('wss://')) {
+                    this.shared.WS_URL = wssUrl;
+                    console.log(`✨ [${this.name}] WSS FOUND: ${this.shared.WS_URL}`);
+                } else {
+                    throw new Error(`Invalid WSS URL: ${wssUrl}`);
+                }
             } else {
                 console.log(`📡 [${this.name}] Using existing WSS: ${this.shared.WS_URL}`);
             }
         } catch (err) {
             console.error(`❌ [${this.name}] Không thể khởi động bot vì lỗi WSS. Reconnecting later...`);
+            this.is_connecting = false;
             setTimeout(() => this.run(landingPage), 10000);
             return;
         }
@@ -145,14 +187,32 @@ class Bot68GB {
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
             "Cookie": this.shared.COOKIES || ""
         };
-        this.ws = new WebSocket(this.shared.WS_URL, { headers });
+        
+        try {
+            this.ws = new WebSocket(this.shared.WS_URL, { headers });
+        } catch (err) {
+            console.error(`❌ [WS] Failed to create WebSocket: ${err.message}`);
+            this.is_connecting = false;
+            setTimeout(() => this.run(landingPage), 5000);
+            return;
+        }
 
         this.ws.on('open', () => {
             console.log(`🌐 [WS] Connected.`);
-            this.ws.send(this.shared.PKT_HANDSHAKE);
+            this.is_connecting = false;
+            
+            // Send handshake
+            if (this.shared.PKT_HANDSHAKE) {
+                this.ws.send(this.shared.PKT_HANDSHAKE);
+            }
+            
+            // Setup heartbeat
+            if (this.heartbeat) clearInterval(this.heartbeat);
             this.heartbeat = setInterval(() => {
-                if (this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(this.shared.PKT_HEARTBEAT);
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    if (this.shared.PKT_HEARTBEAT) {
+                        this.ws.send(this.shared.PKT_HEARTBEAT);
+                    }
                     this.ws.send(this._makePacket("gamecen.gamecenter.queryjackpot"));
 
                     const now = Date.now();
@@ -167,7 +227,9 @@ class Bot68GB {
                         ];
                         reEntry.forEach((r, i) => {
                             setTimeout(() => {
-                                if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(this._makePacket(r));
+                                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                                    this.ws.send(this._makePacket(r));
+                                }
                             }, 300 * i);
                         });
                         this.txhu.last_msg = now;
@@ -179,20 +241,33 @@ class Bot68GB {
 
         this.ws.on('message', (data) => {
             if (!Buffer.isBuffer(data)) return;
-            if (data[0] === 0x01) {
-                this.ws.send(this.shared.PKT_HANDSHAKE_ACK);
-                this._authFlow();
-            } else if (data[0] === 0x04) {
-                this._parse(data);
-            } else if (data[0] === 0x05) {
-                console.log(`⚠️ [WS] Bị KICK.`);
-                this.ws.close();
+            if (data.length === 0) return;
+            
+            try {
+                if (data[0] === 0x01) {
+                    if (this.shared.PKT_HANDSHAKE_ACK) {
+                        this.ws.send(this.shared.PKT_HANDSHAKE_ACK);
+                    }
+                    this._authFlow();
+                } else if (data[0] === 0x04) {
+                    this._parse(data);
+                } else if (data[0] === 0x05) {
+                    console.log(`⚠️ [WS] Bị KICK.`);
+                    this.ws.close();
+                }
+            } catch (err) {
+                console.error(`❌ [WS] Error processing message: ${err.message}`);
             }
         });
 
+        this.ws.on('error', (err) => {
+            console.error(`❌ [WS] Error: ${err.message}`);
+        });
+
         this.ws.on('close', (code, reason) => {
-            console.log(`🔌 [WS] Closed. Code: ${code}, Reason: ${reason}`);
+            console.log(`🔌 [WS] Closed. Code: ${code}, Reason: ${reason || 'No reason'}`);
             this.auth_done = false;
+            this.is_connecting = false;
             if (this.heartbeat) clearInterval(this.heartbeat);
             if (this.auth_timeout) clearTimeout(this.auth_timeout);
 
@@ -232,61 +307,105 @@ class Bot68GB {
     }
 
     _parse(raw) {
-        if (raw.length < 30 && raw.includes('userbet')) return;
-
+        if (raw.length < 30) return;
+        
         const rawBin = raw.toString('binary');
         const text = raw.toString('utf8', 0, 1024);
 
-        if (raw.includes('mnsb') || raw.includes('mnshaibao')) {
+        // Parse TXHU (mnshaibao)
+        if (text.includes('mnshaibao') || text.includes('mnsb')) {
             this.txhu.last_msg = Date.now();
             const s = this._findSession(raw, 'txhu');
             if (s > 200000) this.txhu.prev_session = s;
 
-            // Binary Dice
-            const m = /\x0a\x03([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])/.exec(rawBin);
-            if (m && this.txhu.prev_session) this._emit('HŨ', this.txhu.prev_session, m[1].charCodeAt(0) / 2, m[2].charCodeAt(0) / 2, m[3].charCodeAt(0) / 2);
-
-            // Scene History
-            const hm = /\x22\x03([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])/g;
-            let mt, matched = [];
-            while ((mt = hm.exec(rawBin)) !== null) matched.push(mt);
+            // Binary Dice pattern
+            const dicePattern = /\x0a\x03([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])/g;
+            let match;
+            let matched = [];
+            while ((match = dicePattern.exec(rawBin)) !== null) {
+                matched.push(match);
+            }
+            
             if (this.txhu.prev_session && matched.length > 0) {
-                matched.slice(-10).forEach((mt, i) => {
-                    const hs = this.txhu.prev_session - (matched.length - i);
-                    this._emit('HŨ', hs, mt[1].charCodeAt(0) / 2, mt[2].charCodeAt(0) / 2, mt[3].charCodeAt(0) / 2);
-                });
+                // Process last match first (latest)
+                const last = matched[matched.length - 1];
+                this._emit('HŨ', this.txhu.prev_session, 
+                    last[1].charCodeAt(0) / 2, 
+                    last[2].charCodeAt(0) / 2, 
+                    last[3].charCodeAt(0) / 2
+                );
+                
+                // Process history (limit to last 10)
+                if (matched.length > 1) {
+                    matched.slice(-10).forEach((mt, i) => {
+                        const hs = this.txhu.prev_session - (matched.length - i);
+                        if (hs > 200000) {
+                            this._emit('HŨ', hs, 
+                                mt[1].charCodeAt(0) / 2, 
+                                mt[2].charCodeAt(0) / 2, 
+                                mt[3].charCodeAt(0) / 2
+                            );
+                        }
+                    });
+                }
             }
         }
 
-        if (raw.includes('mnmdsb') || text.includes('MD5')) {
+        // Parse MD5 (mnmdsb)
+        if (text.includes('mnmdsb') || text.includes('MD5')) {
             this.md5.last_msg = Date.now();
             const s = this._findSession(raw, 'md5');
             if (s > 40000 && s < 100000) this.md5.prev_session = s;
 
+            // Extract MD5 hash
             const md5M = /([a-fA-F0-9]{32})/.exec(text);
             if (md5M) this.md5.current_md5 = md5M[1];
 
-            // MD5 Dice: Text or Binary
+            // MD5 Dice: Text format
             const tdice = /(\d)[-,\s]+(\d)[-,\s]+(\d)/.exec(text);
             if (tdice && this.md5.prev_session) {
-                this._emit('MD5', this.md5.prev_session, parseInt(tdice[1]), parseInt(tdice[2]), parseInt(tdice[3]));
+                const d1 = parseInt(tdice[1]);
+                const d2 = parseInt(tdice[2]);
+                const d3 = parseInt(tdice[3]);
+                if (d1 >= 1 && d1 <= 6 && d2 >= 1 && d2 <= 6 && d3 >= 1 && d3 <= 6) {
+                    this._emit('MD5', this.md5.prev_session, d1, d2, d3);
+                }
             } else {
+                // Binary dice for MD5
                 const bdice = /\x0a\x03([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])([\x02\x04\x06\x08\x0a\x0c])/.exec(rawBin);
-                if (bdice && this.md5.prev_session) this._emit('MD5', this.md5.prev_session, bdice[1].charCodeAt(0) / 2, bdice[2].charCodeAt(0) / 2, bdice[3].charCodeAt(0) / 2);
+                if (bdice && this.md5.prev_session) {
+                    this._emit('MD5', this.md5.prev_session, 
+                        bdice[1].charCodeAt(0) / 2, 
+                        bdice[2].charCodeAt(0) / 2, 
+                        bdice[3].charCodeAt(0) / 2
+                    );
+                }
             }
         }
     }
 
     _emit(game, s, d1, d2, d3) {
         if (!s || !d1 || !d2 || !d3) return;
+        if (d1 < 1 || d1 > 6 || d2 < 1 || d2 > 6 || d3 < 1 || d3 > 6) return;
+        
         const sig = `${s}_${d1}${d2}${d3}`;
         const target = game === 'HŨ' ? this.txhu : this.md5;
         if (target.last_sig === sig) return;
         target.last_sig = sig;
 
-        const total = d1 + d2 + d3, res = total > 10 ? "TÀI" : "XỈU";
-        const entry = { "Phiên trước": s, "xúc xắc 1": d1, "xúc xắc 2": d2, "xúc xắc 3": d3, "kết quả": res, "time": new Date().toLocaleTimeString('vi-VN') };
-        if (game === 'MD5') entry["chuỗi md5"] = this.md5.current_md5;
+        const total = d1 + d2 + d3;
+        const res = total > 10 ? "TÀI" : "XỈU";
+        const entry = { 
+            "Phiên trước": s, 
+            "xúc xắc 1": d1, 
+            "xúc xắc 2": d2, 
+            "xúc xắc 3": d3, 
+            "kết quả": res, 
+            "time": new Date().toLocaleTimeString('vi-VN') 
+        };
+        if (game === 'MD5' && this.md5.current_md5) {
+            entry["chuỗi md5"] = this.md5.current_md5;
+        }
 
         const hist = game === 'HŨ' ? this.txhu.history : this.md5.history;
         hist.push(entry);
@@ -296,7 +415,9 @@ class Bot68GB {
         console.log(`🎰 [${game}] #${s} | ${total} ${res} | ${d1}-${d2}-${d3}`);
     }
 
-    isAlive() { return this.ws && this.ws.readyState === WebSocket.OPEN && this.auth_done; }
+    isAlive() { 
+        return this.ws && this.ws.readyState === WebSocket.OPEN && this.auth_done; 
+    }
 }
 
 module.exports = Bot68GB;
