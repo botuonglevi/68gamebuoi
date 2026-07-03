@@ -1,0 +1,30 @@
+{
+  "name": "68gb-bot-unified",
+  "version": "1.0.0",
+  "description": "68GB Bot Unified with WebSocket and Puppeteer",
+  "main": "68.js",
+  "scripts": {
+    "start": "node 68.js",
+    "dev": "nodemon 68.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.1",
+    "puppeteer": "^22.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "68gb",
+    "bot",
+    "websocket",
+    "puppeteer"
+  ],
+  "author": "Antigravity AI & Dwong1410",
+  "license": "MIT"
+}
