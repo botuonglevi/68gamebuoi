@@ -17,24 +17,35 @@ const shared = {
     PKT_HANDSHAKE: Buffer.from('010000727b22737973223a7b22706c6174666f726d223a226a732d776562736f636b6574222c22636c69656e744275696c644e756d626572223a22302e302e31222c22636c69656e7456657273696f6e223a223061323134383164373436663932663834323865316236646565623736666561227d7d', 'hex'),
     PKT_HANDSHAKE_ACK: Buffer.from('02000000', 'hex'),
     PKT_HEARTBEAT: Buffer.from('03000000', 'hex'),
-    PKT_AUTH: Buffer.from('', 'hex') 
+    PKT_AUTH: Buffer.from('', 'hex'),
+    COOKIES: '',
+    SESSION_READY: false
 };
 
 // Nạp token từ TOKEN_HEX đã dán
-if (TOKEN_HEX) {
-    console.log("✅ Using TOKEN_HEX from config");
-    shared.PKT_AUTH = Buffer.from(
-        TOKEN_HEX.replace(/^0x/i, "").replace(/\s+/g, ""),
-        "hex"
-    );
-    shared.SESSION_READY = true;
-    console.log("📝 Token loaded, length:", shared.PKT_AUTH.length, "bytes");
+if (TOKEN_HEX && TOKEN_HEX.length > 0) {
+    try {
+        console.log("✅ Using TOKEN_HEX from config");
+        shared.PKT_AUTH = Buffer.from(
+            TOKEN_HEX.replace(/^0x/i, "").replace(/\s+/g, ""),
+            "hex"
+        );
+        shared.SESSION_READY = true;
+        console.log("📝 Token loaded, length:", shared.PKT_AUTH.length, "bytes");
+    } catch (e) {
+        console.error("❌ Lỗi parse TOKEN_HEX:", e.message);
+        console.log("⚠️ [CONFIG] Token HEX không hợp lệ. Đang chờ nạp qua POST /api/token.");
+    }
 } else {
     console.log("Using token_shared.bin");
     if (fs.existsSync(TOKEN_FILE)) {
-        shared.PKT_AUTH = fs.readFileSync(TOKEN_FILE);
-        shared.SESSION_READY = true;
-        console.log("📝 Token loaded from file");
+        try {
+            shared.PKT_AUTH = fs.readFileSync(TOKEN_FILE);
+            shared.SESSION_READY = true;
+            console.log("📝 Token loaded from file, length:", shared.PKT_AUTH.length, "bytes");
+        } catch (e) {
+            console.error("❌ Lỗi đọc token file:", e.message);
+        }
     } else {
         console.log("⚠️ [CONFIG] Không có Token tĩnh. Cần nạp qua POST /api/token.");
     }
@@ -46,25 +57,58 @@ const server = http.createServer((req, res) => {
     const _cors = (code, body = null, type = 'application/json') => {
         res.writeHead(code, {
             'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Allow-Headers': 'Content-Type',
             'Content-Type': type + '; charset=utf-8'
         });
         res.end(body ? (typeof body === 'string' ? body : JSON.stringify(body)) : "");
     };
 
-    if (req.method === 'POST' && (req.url === '/api/token')) {
+    // Handle OPTIONS preflight
+    if (req.method === 'OPTIONS') {
+        _cors(200);
+        return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/token') {
         let body = '';
         req.on('data', c => body += c);
         req.on('end', () => {
             try {
                 const data = JSON.parse(body);
+                if (!data.token) {
+                    throw new Error("Missing token field");
+                }
                 const hex = data.token.replace(/b'|'|\\x| /g, "");
+                if (hex.length === 0) {
+                    throw new Error("Empty token");
+                }
                 shared.PKT_AUTH = Buffer.from(hex, 'hex');
                 fs.writeFileSync(TOKEN_FILE, shared.PKT_AUTH);
                 shared.SESSION_READY = true;
-                if (bot.ws) bot.ws.close();
-                else bot.run(LANDING_URL);
-                _cors(200, { status: "ok" });
-            } catch (e) { _cors(400, { error: e.message }); }
+                // Restart bot với token mới
+                if (bot.ws) {
+                    bot.ws.close();
+                } else {
+                    // Nếu bot chưa chạy, chạy nó
+                    setTimeout(() => bot.run(LANDING_URL), 500);
+                }
+                _cors(200, { status: "ok", message: "Token updated successfully" });
+            } catch (e) {
+                _cors(400, { error: e.message });
+            }
+        });
+    } else if (req.method === 'POST' && req.url === '/api/cookies') {
+        let body = '';
+        req.on('data', c => body += c);
+        req.on('end', () => {
+            try {
+                const data = JSON.parse(body);
+                shared.COOKIES = data.cookies || '';
+                _cors(200, { status: "ok", message: "Cookies updated" });
+            } catch (e) {
+                _cors(400, { error: e.message });
+            }
         });
     } else if (req.url === '/api/68gb/txhu') {
         _cors(200, bot.txhu.last_result || { error: "No data" });
@@ -74,6 +118,28 @@ const server = http.createServer((req, res) => {
         _cors(200, bot.md5.last_result || { error: "No data" });
     } else if (req.url === '/api/68gb/history/txmd5' || req.url === '/api/history') {
         _cors(200, bot.md5.history.slice().reverse());
+    } else if (req.url === '/api/status') {
+        _cors(200, {
+            alive: bot.isAlive(),
+            ws_ready: bot.ws && bot.ws.readyState === 1,
+            auth_done: bot.auth_done,
+            txhu_count: bot.txhu.history.length,
+            md5_count: bot.md5.history.length,
+            last_txhu: bot.txhu.last_result,
+            last_md5: bot.md5.last_result
+        });
+    } else if (req.url === '/api/refetch') {
+        // Endpoint để lấy lại token từ script bên ngoài
+        _cors(200, { message: "Refetch token initiated" });
+        // Thực thi script lấy token nếu có
+        if (fs.existsSync('./refetch_token.sh')) {
+            exec('bash ./refetch_token.sh', (err, stdout, stderr) => {
+                if (err) console.error('❌ Refetch error:', err);
+                else console.log('✅ Refetch output:', stdout);
+            });
+        } else {
+            console.log('ℹ️ No refetch script found, manual token update required');
+        }
     } else if (req.url === '/' || req.url === '/index.html') {
         _cors(200, getLandingPage(bot.isAlive()), 'text/html');
     } else {
@@ -90,7 +156,15 @@ server.listen(PORT, '0.0.0.0', () => {
         bot.run(LANDING_URL);
     } else {
         console.log("🆕 [INIT] Chưa có Token. Đang chờ nạp qua API...");
+        console.log("📌 POST /api/token với body: { \"token\": \"hex_string\" }");
     }
+});
+
+// Xử lý shutdown gracefully
+process.on('SIGINT', () => {
+    console.log('🛑 Shutting down...');
+    if (bot.ws) bot.ws.close();
+    server.close(() => process.exit(0));
 });
 
 function getLandingPage(botStatus) {
@@ -126,7 +200,12 @@ function getLandingPage(botStatus) {
         header { text-align: center; margin-bottom: 60px; animation: fadeInDown 1s ease; }
         h1 { font-size: 3rem; font-weight: 800; margin-bottom: 10px; background: var(--accent); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         .status-badge { display: inline-flex; align-items: center; padding: 6px 16px; border-radius: 999px; background: ${botStatus ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)'}; color: ${botStatus ? '#4ade80' : '#f87171'}; font-weight: 600; border: 1px solid ${botStatus ? '#4ade8044' : '#f8717144'}; }
-        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; margin-right: 8px; box-shadow: 0 0 10px currentColor; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; margin-right: 8px; box-shadow: 0 0 10px currentColor; animation: pulse 2s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
 
         .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 30px; margin-bottom: 50px; }
         .card { background: var(--card); backdrop-filter: blur(12px); border-radius: 24px; padding: 30px; border: 1px solid rgba(255,255,255,0.08); transition: transform 0.3s ease, box-shadow 0.3s ease; }
@@ -155,13 +234,17 @@ function getLandingPage(botStatus) {
             to { opacity: 1; transform: translateY(0); }
         }
 
-        .loading-bar { height: 2px; width: 100%; background: rgba(255,255,255,0.05); position: fixed; top: 0; left: 0; }
+        .loading-bar { height: 2px; width: 100%; background: rgba(255,255,255,0.05); position: fixed; top: 0; left: 0; z-index: 999; }
         .loading-progress { height: 100%; width: 0%; background: var(--accent); transition: width 0.3s; }
 
         footer { text-align: center; margin-top: 80px; color: var(--secondary); font-size: 0.9rem; padding-bottom: 40px; }
         
         .tai { color: #f87171; }
         .xiu { color: #60a5fa; }
+        
+        .token-form { margin-top: 30px; padding: 20px; background: var(--card); border-radius: 16px; border: 1px solid rgba(255,255,255,0.05); }
+        .token-form input { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: white; font-size: 1rem; font-family: monospace; }
+        .token-form button { margin-top: 10px; width: 100%; }
     </style>
 </head>
 <body>
@@ -210,6 +293,13 @@ function getLandingPage(botStatus) {
                 Lấy Lại Token Mới
             </button>
             <a href="/api/68gb/history/txhu" class="btn btn-secondary">Xem Database</a>
+            <button class="btn btn-secondary" onclick="checkStatus()">Kiểm tra Status</button>
+        </div>
+
+        <div class="token-form">
+            <h3 style="margin-bottom: 10px;">🔑 Cập nhật Token thủ công</h3>
+            <input type="text" id="tokenInput" placeholder="Nhập token hex ở đây..." />
+            <button class="btn btn-primary" onclick="updateToken()">Cập nhật Token</button>
         </div>
 
         <div class="api-links">
@@ -218,6 +308,7 @@ function getLandingPage(botStatus) {
             <a href="/api/68gb/txmd5" class="link-chip">/api/68gb/txmd5</a>
             <a href="/api/68gb/history/txhu" class="link-chip">/api/68gb/history/txhu</a>
             <a href="/api/68gb/history/txmd5" class="link-chip">/api/68gb/history/txmd5</a>
+            <a href="/api/status" class="link-chip">/api/status</a>
         </div>
 
         <footer>
@@ -237,28 +328,72 @@ function getLandingPage(botStatus) {
                 prog.style.width = '70%';
 
                 if (!txhuRes.error) {
-                    document.getElementById('txhu-s').innerText = '#' + txhuRes['Phiên trước'];
+                    document.getElementById('txhu-s').innerText = '#' + (txhuRes['Phiên trước'] || '000000');
                     const resEl = document.getElementById('txhu-res');
-                    resEl.innerText = txhuRes['kết quả'];
-                    resEl.className = 'result-val ' + (txhuRes['kết quả'] === 'TÀI' ? 'tai' : 'xiu');
-                    document.getElementById('txhu-dice').innerText = \`\${txhuRes['xúc xắc 1']} - \${txhuRes['xúc xắc 2']} - \${txhuRes['xúc xắc 3']}\`;
+                    const result = txhuRes['kết quả'] || 'ĐANG CHỜ';
+                    resEl.innerText = result;
+                    resEl.className = 'result-val ' + (result === 'TÀI' ? 'tai' : result === 'XỈU' ? 'xiu' : '');
+                    document.getElementById('txhu-dice').innerText = \`\${txhuRes['xúc xắc 1'] || 0} - \${txhuRes['xúc xắc 2'] || 0} - \${txhuRes['xúc xắc 3'] || 0}\`;
                 }
 
                 if (!md5Res.error) {
-                    document.getElementById('md5-s').innerText = '#' + md5Res['Phiên trước'];
+                    document.getElementById('md5-s').innerText = '#' + (md5Res['Phiên trước'] || '00000');
                     const resEl = document.getElementById('md5-res');
-                    resEl.innerText = md5Res['kết quả'];
-                    resEl.className = 'result-val ' + (md5Res['kết quả'] === 'TÀI' ? 'tai' : 'xiu');
-                    document.getElementById('md5-dice').innerText = \`\${md5Res['xúc xắc 1']} - \${md5Res['xúc xắc 2']} - \${md5Res['xúc xắc 3']}\`;
+                    const result = md5Res['kết quả'] || 'ĐANG CHỜ';
+                    resEl.innerText = result;
+                    resEl.className = 'result-val ' + (result === 'TÀI' ? 'tai' : result === 'XỈU' ? 'xiu' : '');
+                    document.getElementById('md5-dice').innerText = \`\${md5Res['xúc xắc 1'] || 0} - \${md5Res['xúc xắc 2'] || 0} - \${md5Res['xúc xắc 3'] || 0}\`;
                 }
                 prog.style.width = '100%';
                 setTimeout(() => prog.style.width = '0%', 400);
-            } catch (e) { console.error(e); }
+            } catch (e) { 
+                console.error('Update error:', e); 
+                prog.style.width = '0%';
+            }
         }
 
         function refetchToken() {
             if(!confirm('Xác nhận chạy script lấy Token tự động?\\n(Quá trình mất 1-2 phút)')) return;
-            fetch('/api/refetch').then(() => alert('Đã gửi yêu cầu lấy Token! Vui lòng chờ...'));
+            fetch('/api/refetch')
+                .then(r => r.json())
+                .then(data => alert('✅ ' + data.message))
+                .catch(() => alert('❌ Lỗi khi gửi yêu cầu!'));
+        }
+
+        async function updateToken() {
+            const input = document.getElementById('tokenInput');
+            const token = input.value.trim();
+            if (!token) {
+                alert('⚠️ Vui lòng nhập token hex!');
+                return;
+            }
+            try {
+                const res = await fetch('/api/token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: token })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    alert('✅ ' + data.message);
+                    input.value = '';
+                    setTimeout(updateData, 2000);
+                } else {
+                    alert('❌ Lỗi: ' + data.error);
+                }
+            } catch (e) {
+                alert('❌ Lỗi kết nối: ' + e.message);
+            }
+        }
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                alert(JSON.stringify(data, null, 2));
+            } catch (e) {
+                alert('❌ Lỗi: ' + e.message);
+            }
         }
 
         setInterval(updateData, 5000);
@@ -267,4 +402,4 @@ function getLandingPage(botStatus) {
 </body>
 </html>
     `;
-}
+            }
