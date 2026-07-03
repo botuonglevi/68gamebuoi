@@ -4,11 +4,10 @@ const { exec, execSync, spawn } = require('child_process');
 const Bot68GB = require('./bot_unified');
 
 // ─── ĐÃ DÁN TOKEN VÀ WSS URL VÀO ĐÂY ─────────────────────────────────────────
-const TOKEN_HEX = "010000687b22636f6465223a3230302c22737973223a7b22686561727462656174223a31352c2273657269616c697a657222";
-const WS_URL_ENV = "wss://mtsahwkvbim09mnwv.cq.qnwxdhwica.com/";
-
+const TOKEN_HEX = "39d0d674c5394f1ba205f4f99e436a1feb8404fb13894a778048363de5a1f778";
+const WS_URL_ENV = "wss://fwagctub7g0j.cq.qnwxdhwica.com";
 // ─── CẤU HÌNH ────────────────────────────────────────────────────────────────
-const LANDING_URL = "https://68gbvn88.bar";
+const LANDING_URL = "https://68gbvn88.baby";
 const TOKEN_FILE = "token_shared.bin";
 const PORT = parseInt(process.env.PORT || "8080");
 
